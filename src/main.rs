@@ -297,35 +297,15 @@ fn make_sender(addr: &Ipv4Addr) -> Result<Socket, std::io::Error> {
     Ok(sock)
 }
 
-fn get_iface_addr(name: &str) -> Option<Ipv4Addr> {
-    use nix::ifaddrs::getifaddrs;
-    use nix::sys::socket::AddressFamily;
-    let addrs = getifaddrs().ok()?;
-    for ifaddr in addrs {
-        if ifaddr.interface_name != name {
-            continue;
-        }
-        if let Some(addr) = ifaddr.address {
-            if addr.family() == Some(AddressFamily::Inet) {
-                // Safe to call as_sockaddr_in on a local binding
-                let storage = addr;
-                if let Some(sin) = storage.as_sockaddr_in() {
-                    return Some(Ipv4Addr::from(sin.ip()));
-                }
-            }
-        }
-    }
-    None
-}
-
 fn discover_docker_bridges() -> Vec<String> {
     use nix::ifaddrs::getifaddrs;
+    use nix::sys::socket::AddressFamily;
     let mut names = std::collections::HashSet::new();
     if let Ok(addrs) = getifaddrs() {
         for ifaddr in addrs {
             let name = &ifaddr.interface_name;
             if (name.starts_with("br-") || name == "docker0")
-                && ifaddr.address.map(|a| a.family()) == Some(nix::sys::socket::AddressFamily::Inet)
+                && ifaddr.address.map(|a| a.family()) == Some(Some(AddressFamily::Inet))
             {
                 names.insert(name.clone());
             }
@@ -338,6 +318,7 @@ fn discover_docker_bridges() -> Vec<String> {
 
 fn discover_host_nic() -> Option<String> {
     use nix::ifaddrs::getifaddrs;
+    use nix::sys::socket::AddressFamily;
     let skip_prefixes = ["lo", "br-", "docker", "veth", "virbr", "tun", "tap"];
     let addrs = getifaddrs().ok()?;
     for ifaddr in addrs {
@@ -345,8 +326,27 @@ fn discover_host_nic() -> Option<String> {
         if skip_prefixes.iter().any(|p| name.starts_with(p)) {
             continue;
         }
-        if ifaddr.address.map(|a| a.family()) == Some(nix::sys::socket::AddressFamily::Inet) {
+        if ifaddr.address.map(|a| a.family()) == Some(Some(AddressFamily::Inet)) {
             return Some(name.clone());
+        }
+    }
+    None
+}
+
+fn get_iface_addr(name: &str) -> Option<Ipv4Addr> {
+    use nix::ifaddrs::getifaddrs;
+    use nix::sys::socket::AddressFamily;
+    let addrs = getifaddrs().ok()?;
+    for ifaddr in addrs {
+        if ifaddr.interface_name != name {
+            continue;
+        }
+        if let Some(addr) = ifaddr.address {
+            if addr.family() == Some(AddressFamily::Inet) {
+                if let Some(sin) = addr.as_sockaddr_in() {
+                    return Some(Ipv4Addr::from(sin.ip()));
+                }
+            }
         }
     }
     None
