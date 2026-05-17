@@ -12,17 +12,9 @@ RUN mkdir src && echo 'fn main(){}' > src/main.rs && \
 COPY src ./src
 RUN touch src/main.rs && cargo build --release
 
-
 FROM alpine:3.19
 
-RUN apk add --no-cache libcap && \
-    adduser -D -u 1000 repeater
-
 COPY --from=builder /app/target/release/mdns-repeater /usr/local/bin/mdns-repeater
-
-RUN setcap cap_net_admin,cap_net_raw+ep /usr/local/bin/mdns-repeater
-
-USER repeater
 
 ENV LOG_FORMAT=pretty
 ENV LOG_LEVEL=info
