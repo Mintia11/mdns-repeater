@@ -351,7 +351,7 @@ fn recv_raw_with_iface(
         msg.msg_iov = &mut iov;
         msg.msg_iovlen = 1;
         msg.msg_control = ctrl.as_mut_ptr() as *mut libc::c_void;
-        msg.msg_controllen = ctrl.len();
+        msg.msg_controllen = ctrl.len() as u32;
 
         let n = libc::recvmsg(fd, &mut msg, libc::MSG_DONTWAIT);
         if n < 0 {
