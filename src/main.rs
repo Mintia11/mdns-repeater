@@ -298,14 +298,19 @@ fn make_sender(addr: &Ipv4Addr) -> Result<Socket, std::io::Error> {
 
 fn get_iface_addr(name: &str) -> Option<Ipv4Addr> {
     use nix::ifaddrs::getifaddrs;
+    use nix::sys::socket::AddressFamily;
     let addrs = getifaddrs().ok()?;
     for ifaddr in addrs {
         if ifaddr.interface_name != name {
             continue;
         }
         if let Some(addr) = ifaddr.address {
-            if let Some(sin) = addr.as_sockaddr_in() {
-                return Some(Ipv4Addr::from(sin.ip()));
+            if addr.family() == Some(AddressFamily::Inet) {
+                // Safe to call as_sockaddr_in on a local binding
+                let storage = addr;
+                if let Some(sin) = storage.as_sockaddr_in() {
+                    return Some(Ipv4Addr::from(sin.ip()));
+                }
             }
         }
     }
@@ -319,7 +324,7 @@ fn discover_docker_bridges() -> Vec<String> {
         for ifaddr in addrs {
             let name = &ifaddr.interface_name;
             if (name.starts_with("br-") || name == "docker0")
-                && ifaddr.address.and_then(|a| a.as_sockaddr_in()).is_some()
+                && ifaddr.address.map(|a| a.family()) == Some(nix::sys::socket::AddressFamily::Inet)
             {
                 names.insert(name.clone());
             }
@@ -339,7 +344,7 @@ fn discover_host_nic() -> Option<String> {
         if skip_prefixes.iter().any(|p| name.starts_with(p)) {
             continue;
         }
-        if ifaddr.address.and_then(|a| a.as_sockaddr_in()).is_some() {
+        if ifaddr.address.map(|a| a.family()) == Some(nix::sys::socket::AddressFamily::Inet) {
             return Some(name.clone());
         }
     }
