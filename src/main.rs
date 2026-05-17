@@ -32,7 +32,6 @@ async fn main() {
         "mdns-repeater starting"
     );
 
-    // Collect interfaces
     let mut iface_names: Vec<String> = std::env::var("INTERFACES")
         .unwrap_or_default()
         .split(',')
@@ -43,10 +42,15 @@ async fn main() {
     if iface_names.is_empty() {
         info!("INTERFACES not set, auto-discovering Docker bridges");
         iface_names = discover_docker_bridges();
+
         if let Ok(host) = std::env::var("HOST_IFACE") {
+            info!(iface = %host, "using HOST_IFACE env var");
             iface_names.push(host);
+        } else if let Some(nic) = discover_host_nic() {
+            info!(iface = %nic, "auto-detected host NIC");
+            iface_names.push(nic);
         } else {
-            iface_names.push("eth0".to_string());
+            warn!("could not auto-detect host NIC — set HOST_IFACE env var explicitly");
         }
     }
 
@@ -86,16 +90,17 @@ async fn main() {
     let stats = Arc::new(Stats::default());
 
     let senders: Arc<Vec<(Iface, Arc<Socket>)>> = Arc::new(
-        ifaces
-            .iter()
-            .map(|iface| {
-                let sock = make_sender(&iface.addr).expect("sender socket");
-                (iface.clone(), Arc::new(sock))
-            })
-            .collect(),
+        ifaces.iter().filter_map(|iface| {
+            match make_sender(&iface.addr) {
+                Ok(sock) => Some((iface.clone(), Arc::new(sock))),
+                Err(e) => {
+                    warn!(iface = %iface.name, error = %e, "failed to create sender socket, skipping");
+                    None
+                }
+            }
+        }).collect()
     );
 
-    // Listener tasks
     let mut handles = vec![];
     for iface in &ifaces {
         let iface = iface.clone();
@@ -108,7 +113,6 @@ async fn main() {
         }));
     }
 
-    // Periodic stats log — visible in `docker logs`
     let stats_log = Arc::clone(&stats);
     let stats_interval_secs: u64 = std::env::var("STATS_INTERVAL_SECS")
         .ok()
@@ -130,7 +134,6 @@ async fn main() {
         }
     });
 
-    // Dedup cache cleanup
     let seen_cleanup = Arc::clone(&seen);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(10));
@@ -158,10 +161,32 @@ async fn listen_and_repeat(
     seen: Arc<Mutex<HashMap<PacketKey, Instant>>>,
     stats: Arc<Stats>,
 ) {
-    let sock = make_listener(&iface.addr).expect("listener socket");
+    let sock = match make_listener(&iface.addr) {
+        Ok(s) => s,
+        Err(e) => {
+            error!(
+                iface = %iface.name,
+                error = %e,
+                "failed to create listener socket — is avahi or systemd-resolved holding port 5353? \
+                 try: ss -ulnp | grep 5353"
+            );
+            return;
+        }
+    };
+
     let std_sock: std::net::UdpSocket = sock.into();
-    std_sock.set_nonblocking(true).unwrap();
-    let udp = tokio::net::UdpSocket::from_std(std_sock).unwrap();
+    if let Err(e) = std_sock.set_nonblocking(true) {
+        error!(iface = %iface.name, error = %e, "set_nonblocking failed");
+        return;
+    }
+
+    let udp = match tokio::net::UdpSocket::from_std(std_sock) {
+        Ok(s) => s,
+        Err(e) => {
+            error!(iface = %iface.name, error = %e, "failed to convert to tokio socket");
+            return;
+        }
+    };
 
     info!(iface = %iface.name, addr = %iface.addr, "listener started");
 
@@ -172,6 +197,8 @@ async fn listen_and_repeat(
             Err(e) => {
                 warn!(iface = %iface.name, error = %e, "recv error");
                 stats.inc_errors();
+                // Small backoff to avoid a tight error loop
+                tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
         };
@@ -179,6 +206,7 @@ async fn listen_and_repeat(
         stats.inc_received();
 
         let pkt = &buf[..len];
+
         let mut key = [0u8; 32];
         key[..len.min(32)].copy_from_slice(&pkt[..len.min(32)]);
 
@@ -207,7 +235,7 @@ async fn listen_and_repeat(
 
         debug!(
             iface = %iface.name,
-            src = %src_ip,
+            src   = %src_ip,
             bytes = len,
             "received mDNS packet, forwarding"
         );
@@ -226,8 +254,8 @@ async fn listen_and_repeat(
                 }
                 Err(e) => {
                     warn!(
-                        from = %iface.name,
-                        to   = %other.name,
+                        from  = %iface.name,
+                        to    = %other.name,
                         error = %e,
                         "forward error"
                     );
@@ -237,8 +265,8 @@ async fn listen_and_repeat(
         }
 
         debug!(
-            iface = %iface.name,
-            src   = %src_ip,
+            iface        = %iface.name,
+            src          = %src_ip,
             forwarded_to = fwd_count,
             "done"
         );
@@ -249,7 +277,10 @@ fn make_listener(addr: &Ipv4Addr) -> Result<Socket, std::io::Error> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     sock.set_reuse_address(true)?;
     sock.set_reuse_port(true)?;
-    sock.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, MDNS_PORT).into())?;
+    // Bind to the multicast address rather than UNSPECIFIED so we can
+    // coexist with avahi / systemd-resolved which bind to 0.0.0.0:5353.
+    // The kernel still delivers multicast copies to all matching sockets.
+    sock.bind(&SocketAddrV4::new(MDNS_ADDR, MDNS_PORT).into())?;
     sock.join_multicast_v4(&MDNS_ADDR, addr)?;
     sock.set_multicast_loop_v4(false)?;
     Ok(sock)
@@ -286,13 +317,31 @@ fn discover_docker_bridges() -> Vec<String> {
     let mut names = std::collections::HashSet::new();
     if let Ok(addrs) = getifaddrs() {
         for ifaddr in addrs {
-            let n = &ifaddr.interface_name;
-            if (n.starts_with("br-") || n == "docker0") && ifaddr.address.is_some() {
-                names.insert(n.clone());
+            let name = &ifaddr.interface_name;
+            if (name.starts_with("br-") || name == "docker0")
+                && ifaddr.address.and_then(|a| a.as_sockaddr_in()).is_some()
+            {
+                names.insert(name.clone());
             }
         }
     }
     let mut v: Vec<_> = names.into_iter().collect();
     v.sort();
     v
+}
+
+fn discover_host_nic() -> Option<String> {
+    use nix::ifaddrs::getifaddrs;
+    let skip_prefixes = ["lo", "br-", "docker", "veth", "virbr", "tun", "tap"];
+    let addrs = getifaddrs().ok()?;
+    for ifaddr in addrs {
+        let name = &ifaddr.interface_name;
+        if skip_prefixes.iter().any(|p| name.starts_with(p)) {
+            continue;
+        }
+        if ifaddr.address.and_then(|a| a.as_sockaddr_in()).is_some() {
+            return Some(name.clone());
+        }
+    }
+    None
 }
