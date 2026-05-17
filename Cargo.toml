@@ -1,0 +1,13 @@
+[package]
+name = "mdns-repeater"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+nix = { version = "0.31.3", features = ["net"] }
+serde_json = "1.0.149"
+socket2 = "0.6.3"
+tokio = { version = "1.52.3", features = ["full"] }
+tokio-metrics = "0.5.0"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
