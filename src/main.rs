@@ -1,11 +1,11 @@
 mod logging;
 mod stats;
 
-use nix::sys::socket::SockaddrLike;
 use socket2::{Domain, Protocol, Socket, Type};
 use stats::Stats;
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddrV4};
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -17,10 +17,11 @@ const DEDUP_TTL: Duration = Duration::from_secs(1);
 
 type PacketKey = [u8; 32];
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Iface {
     name: String,
     addr: Ipv4Addr,
+    index: u32,
 }
 
 #[tokio::main]
@@ -59,18 +60,27 @@ async fn main() {
 
     let ifaces: Vec<Iface> = iface_names
         .iter()
-        .filter_map(|name| match get_iface_addr(name) {
-            Some(addr) => {
-                info!(iface = %name, addr = %addr, "interface ready");
-                Some(Iface {
-                    name: name.clone(),
-                    addr,
-                })
-            }
-            None => {
-                warn!(iface = %name, "could not resolve interface address, skipping");
-                None
-            }
+        .filter_map(|name| {
+            let addr = match get_iface_addr(name) {
+                Some(a) => a,
+                None => {
+                    warn!(iface = %name, "could not resolve address, skipping");
+                    return None;
+                }
+            };
+            let index = match get_iface_index(name) {
+                Some(i) => i,
+                None => {
+                    warn!(iface = %name, "could not resolve interface index, skipping");
+                    return None;
+                }
+            };
+            info!(iface = %name, %addr, index, "interface ready");
+            Some(Iface {
+                name: name.clone(),
+                addr,
+                index,
+            })
         })
         .collect();
 
@@ -90,38 +100,39 @@ async fn main() {
     let seen: Arc<Mutex<HashMap<PacketKey, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
     let stats = Arc::new(Stats::default());
 
+    // One sender socket per interface, bound to that interface's address
     let senders: Arc<Vec<(Iface, Arc<Socket>)>> = Arc::new(
-        ifaces.iter().filter_map(|iface| {
-            match make_sender(&iface.addr) {
+        ifaces
+            .iter()
+            .filter_map(|iface| match make_sender(&iface.addr) {
                 Ok(sock) => Some((iface.clone(), Arc::new(sock))),
                 Err(e) => {
-                    warn!(iface = %iface.name, error = %e, "failed to create sender socket, skipping");
+                    warn!(iface = %iface.name, error = %e, "failed to create sender, skipping");
                     None
                 }
-            }
-        }).collect()
+            })
+            .collect(),
     );
 
-    let mut handles = vec![];
-    for iface in &ifaces {
-        let iface = iface.clone();
-        let senders = Arc::clone(&senders);
-        let seen = Arc::clone(&seen);
-        let stats = Arc::clone(&stats);
+    let ifaces = Arc::new(ifaces);
 
-        handles.push(tokio::spawn(async move {
-            listen_and_repeat(iface, senders, seen, stats).await;
-        }));
-    }
+    // Single raw listener instead of one UDP socket per interface
+    tokio::spawn(run_listener(
+        Arc::clone(&ifaces),
+        Arc::clone(&senders),
+        Arc::clone(&seen),
+        Arc::clone(&stats),
+    ));
 
+    // Periodic stats
     let stats_log = Arc::clone(&stats);
-    let stats_interval_secs: u64 = std::env::var("STATS_INTERVAL_SECS")
+    let stats_interval: u64 = std::env::var("STATS_INTERVAL_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(60);
 
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(stats_interval_secs));
+        let mut interval = tokio::time::interval(Duration::from_secs(stats_interval));
         loop {
             interval.tick().await;
             let s = stats_log.snapshot();
@@ -135,6 +146,7 @@ async fn main() {
         }
     });
 
+    // Dedup cache cleanup
     let seen_cleanup = Arc::clone(&seen);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(10));
@@ -151,77 +163,100 @@ async fn main() {
     });
 
     info!("repeater running — press ctrl-c to stop");
-    for h in handles {
-        let _ = h.await;
-    }
+
+    // Park the main task forever
+    tokio::signal::ctrl_c().await.ok();
+    info!("shutting down");
 }
 
-async fn listen_and_repeat(
-    iface: Iface,
+async fn run_listener(
+    ifaces: Arc<Vec<Iface>>,
     senders: Arc<Vec<(Iface, Arc<Socket>)>>,
     seen: Arc<Mutex<HashMap<PacketKey, Instant>>>,
     stats: Arc<Stats>,
 ) {
-    let sock = match make_listener(&iface.addr) {
+    let sock = match make_raw_listener() {
         Ok(s) => s,
         Err(e) => {
-            error!(
-                iface = %iface.name,
-                error = %e,
-                "failed to create listener socket — is avahi or systemd-resolved holding port 5353? \
-                 try: ss -ulnp | grep 5353"
-            );
+            error!(error = %e, "failed to create raw socket — is NET_RAW capability set?");
             return;
         }
     };
 
-    let std_sock: std::net::UdpSocket = sock.into();
-    if let Err(e) = std_sock.set_nonblocking(true) {
-        error!(iface = %iface.name, error = %e, "set_nonblocking failed");
-        return;
-    }
+    let fd = sock.as_raw_fd();
 
-    let udp = match tokio::net::UdpSocket::from_std(std_sock) {
-        Ok(s) => s,
-        Err(e) => {
-            error!(iface = %iface.name, error = %e, "failed to convert to tokio socket");
-            return;
-        }
-    };
+    // Convert to std UdpSocket just so tokio can poll readability on the fd.
+    // We never actually call recv on this — we use recvmsg directly.
+    let std_sock: std::net::UdpSocket = unsafe { FromRawFd::from_raw_fd(fd) };
+    std_sock.set_nonblocking(true).unwrap();
+    let udp = tokio::net::UdpSocket::from_std(std_sock).unwrap();
 
-    info!(iface = %iface.name, addr = %iface.addr, "listener started");
+    // Prevent the socket2::Socket from closing fd when it drops
+    std::mem::forget(sock);
 
-    let mut buf = vec![0u8; 9000];
+    info!("raw listener started");
+
+    let mut buf = vec![0u8; 65535];
+
     loop {
-        let (len, src) = match udp.recv_from(&mut buf).await {
+        // Wait until the fd is readable, then do a non-blocking recvmsg
+        if let Err(e) = udp.readable().await {
+            error!(error = %e, "readable() error");
+            break;
+        }
+
+        let (len, iface_index) = match recv_raw_with_iface(fd, &mut buf) {
             Ok(v) => v,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
             Err(e) => {
-                warn!(iface = %iface.name, error = %e, "recv error");
+                warn!(error = %e, "recvmsg error");
                 stats.inc_errors();
-                // Small backoff to avoid a tight error loop
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
         };
 
+        // --- Parse IP header ---
+        if len < 20 {
+            continue;
+        }
+        let ip_header_len = ((buf[0] & 0x0f) as usize) * 4;
+        if len < ip_header_len + 8 {
+            continue;
+        }
+
+        // Only care about packets destined for 224.0.0.251
+        let dst_ip = Ipv4Addr::new(buf[16], buf[17], buf[18], buf[19]);
+        if dst_ip != MDNS_ADDR {
+            continue;
+        }
+
+        // --- Parse UDP header ---
+        let udp_start = ip_header_len;
+        let dst_port = u16::from_be_bytes([buf[udp_start + 2], buf[udp_start + 3]]);
+        if dst_port != MDNS_PORT {
+            continue;
+        }
+
+        // --- mDNS payload ---
+        let payload_start = udp_start + 8;
+        if len <= payload_start {
+            continue;
+        }
+        let pkt = buf[payload_start..len].to_vec();
+
         stats.inc_received();
 
-        let pkt = &buf[..len];
-
+        // Dedup on first 32 bytes of payload
         let mut key = [0u8; 32];
-        key[..len.min(32)].copy_from_slice(&pkt[..len.min(32)]);
+        key[..pkt.len().min(32)].copy_from_slice(&pkt[..pkt.len().min(32)]);
 
         {
             let mut map = seen.lock().await;
             let now = Instant::now();
             if let Some(t) = map.get(&key) {
                 if t.elapsed() < DEDUP_TTL {
-                    debug!(
-                        iface = %iface.name,
-                        src = %src,
-                        bytes = len,
-                        "packet deduplicated"
-                    );
+                    debug!(iface_index, "deduplicated");
                     stats.inc_deduplicated();
                     continue;
                 }
@@ -229,65 +264,62 @@ async fn listen_and_repeat(
             map.insert(key, now);
         }
 
-        let src_ip = match src.ip() {
-            IpAddr::V4(ip) => ip,
-            _ => continue,
-        };
+        let in_name = ifaces
+            .iter()
+            .find(|i| i.index == iface_index)
+            .map(|i| i.name.as_str())
+            .unwrap_or("unknown");
 
-        debug!(
-            iface = %iface.name,
-            src   = %src_ip,
-            bytes = len,
-            "received mDNS packet, forwarding"
-        );
+        debug!(iface = %in_name, bytes = pkt.len(), "received mDNS, forwarding");
 
         let dest = std::net::SocketAddr::V4(SocketAddrV4::new(MDNS_ADDR, MDNS_PORT));
         let mut fwd_count = 0u32;
 
-        for (other, sender) in senders.iter() {
-            if other.name == iface.name {
-                continue;
+        for (iface, sender) in senders.iter() {
+            if iface.index == iface_index {
+                continue; // don't echo back to the source interface
             }
-            match sender.send_to(pkt, &dest.into()) {
+            match sender.send_to(&pkt, &dest.into()) {
                 Ok(_) => {
                     fwd_count += 1;
                     stats.inc_forwarded();
+                    debug!(to = %iface.name, "forwarded");
                 }
                 Err(e) => {
-                    warn!(
-                        from  = %iface.name,
-                        to    = %other.name,
-                        error = %e,
-                        "forward error"
-                    );
+                    warn!(to = %iface.name, error = %e, "forward error");
                     stats.inc_errors();
                 }
             }
         }
 
-        debug!(
-            iface        = %iface.name,
-            src          = %src_ip,
-            forwarded_to = fwd_count,
-            "done"
-        );
+        debug!(iface = %in_name, forwarded_to = fwd_count, "done");
     }
 }
 
-fn make_listener(addr: &Ipv4Addr) -> Result<Socket, std::io::Error> {
-    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-    sock.set_reuse_address(true)?;
-    sock.set_reuse_port(true)?;
-    // Bind to the multicast address rather than UNSPECIFIED so we can
-    // coexist with avahi / systemd-resolved which bind to 0.0.0.0:5353.
-    // The kernel still delivers multicast copies to all matching sockets.
-    sock.bind(&SocketAddrV4::new(MDNS_ADDR, MDNS_PORT).into())?;
-    sock.join_multicast_v4(&MDNS_ADDR, addr)?;
-    sock.set_multicast_loop_v4(false)?;
+fn make_raw_listener() -> std::io::Result<Socket> {
+    // IPPROTO_UDP raw socket — receives all UDP packets, we filter in userspace
+    let sock = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::UDP))?;
+    sock.set_nonblocking(true)?;
+
+    // Enable IP_PKTINFO so recvmsg tells us which interface each packet arrived on
+    unsafe {
+        let one: libc::c_int = 1;
+        let ret = libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_PKTINFO,
+            &one as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+
     Ok(sock)
 }
 
-fn make_sender(addr: &Ipv4Addr) -> Result<Socket, std::io::Error> {
+fn make_sender(addr: &Ipv4Addr) -> std::io::Result<Socket> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     sock.set_reuse_address(true)?;
     sock.bind(&SocketAddrV4::new(*addr, 0).into())?;
@@ -295,6 +327,75 @@ fn make_sender(addr: &Ipv4Addr) -> Result<Socket, std::io::Error> {
     sock.set_multicast_ttl_v4(1)?;
     sock.set_nonblocking(true)?;
     Ok(sock)
+}
+
+fn recv_raw_with_iface(
+    fd: std::os::unix::io::RawFd,
+    buf: &mut [u8],
+) -> std::io::Result<(usize, u32)> {
+    unsafe {
+        let mut iov = libc::iovec {
+            iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+            iov_len: buf.len(),
+        };
+
+        // Control buffer for IP_PKTINFO cmsg
+        let mut ctrl = [0u8; 256];
+        let mut src: libc::sockaddr_in = std::mem::zeroed();
+
+        let mut msg = libc::msghdr {
+            msg_name: &mut src as *mut _ as *mut libc::c_void,
+            msg_namelen: std::mem::size_of::<libc::sockaddr_in>() as u32,
+            msg_iov: &mut iov,
+            msg_iovlen: 1,
+            msg_control: ctrl.as_mut_ptr() as *mut libc::c_void,
+            msg_controllen: ctrl.len(),
+            msg_flags: 0,
+        };
+
+        let n = libc::recvmsg(fd, &mut msg, libc::MSG_DONTWAIT);
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let mut iface_index = 0u32;
+        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+        while !cmsg.is_null() {
+            let hdr = &*cmsg;
+            if hdr.cmsg_level == libc::IPPROTO_IP && hdr.cmsg_type == libc::IP_PKTINFO {
+                let info = libc::CMSG_DATA(cmsg) as *const libc::in_pktinfo;
+                iface_index = (*info).ipi_ifindex as u32;
+            }
+            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+        }
+
+        Ok((n as usize, iface_index))
+    }
+}
+
+fn get_iface_addr(name: &str) -> Option<Ipv4Addr> {
+    use nix::ifaddrs::getifaddrs;
+    use nix::sys::socket::AddressFamily;
+    let addrs = getifaddrs().ok()?;
+    for ifaddr in addrs {
+        if ifaddr.interface_name != name {
+            continue;
+        }
+        if let Some(addr) = ifaddr.address {
+            if addr.family() == Some(AddressFamily::Inet) {
+                if let Some(sin) = addr.as_sockaddr_in() {
+                    return Some(Ipv4Addr::from(sin.ip()));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn get_iface_index(name: &str) -> Option<u32> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    let idx = unsafe { libc::if_nametoindex(cname.as_ptr()) };
+    if idx == 0 { None } else { Some(idx) }
 }
 
 fn discover_docker_bridges() -> Vec<String> {
@@ -328,25 +429,6 @@ fn discover_host_nic() -> Option<String> {
         }
         if ifaddr.address.map(|a| a.family()) == Some(Some(AddressFamily::Inet)) {
             return Some(name.clone());
-        }
-    }
-    None
-}
-
-fn get_iface_addr(name: &str) -> Option<Ipv4Addr> {
-    use nix::ifaddrs::getifaddrs;
-    use nix::sys::socket::AddressFamily;
-    let addrs = getifaddrs().ok()?;
-    for ifaddr in addrs {
-        if ifaddr.interface_name != name {
-            continue;
-        }
-        if let Some(addr) = ifaddr.address {
-            if addr.family() == Some(AddressFamily::Inet) {
-                if let Some(sin) = addr.as_sockaddr_in() {
-                    return Some(Ipv4Addr::from(sin.ip()));
-                }
-            }
         }
     }
     None

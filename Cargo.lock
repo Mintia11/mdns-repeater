@@ -133,6 +133,7 @@ dependencies = [
 name = "mdns-repeater"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "nix",
  "serde_json",
  "socket2",
