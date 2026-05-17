@@ -1,6 +1,8 @@
 mod logging;
 mod stats;
 
+use nix::ifaddrs::getifaddrs;
+use nix::sys::socket::{AddressFamily, SockaddrLike};
 use socket2::{Domain, Protocol, Socket, Type};
 use stats::Stats;
 use std::collections::HashMap;
@@ -339,19 +341,17 @@ fn recv_raw_with_iface(
             iov_len: buf.len(),
         };
 
-        // Control buffer for IP_PKTINFO cmsg
         let mut ctrl = [0u8; 256];
         let mut src: libc::sockaddr_in = std::mem::zeroed();
 
-        let mut msg = libc::msghdr {
-            msg_name: &mut src as *mut _ as *mut libc::c_void,
-            msg_namelen: std::mem::size_of::<libc::sockaddr_in>() as u32,
-            msg_iov: &mut iov,
-            msg_iovlen: 1,
-            msg_control: ctrl.as_mut_ptr() as *mut libc::c_void,
-            msg_controllen: ctrl.len(),
-            msg_flags: 0,
-        };
+        // Can't use struct literal — libc::msghdr has private padding fields
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_name = &mut src as *mut _ as *mut libc::c_void;
+        msg.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as u32;
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = ctrl.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = ctrl.len();
 
         let n = libc::recvmsg(fd, &mut msg, libc::MSG_DONTWAIT);
         if n < 0 {
@@ -374,8 +374,6 @@ fn recv_raw_with_iface(
 }
 
 fn get_iface_addr(name: &str) -> Option<Ipv4Addr> {
-    use nix::ifaddrs::getifaddrs;
-    use nix::sys::socket::AddressFamily;
     let addrs = getifaddrs().ok()?;
     for ifaddr in addrs {
         if ifaddr.interface_name != name {
@@ -399,8 +397,6 @@ fn get_iface_index(name: &str) -> Option<u32> {
 }
 
 fn discover_docker_bridges() -> Vec<String> {
-    use nix::ifaddrs::getifaddrs;
-    use nix::sys::socket::AddressFamily;
     let mut names = std::collections::HashSet::new();
     if let Ok(addrs) = getifaddrs() {
         for ifaddr in addrs {
@@ -418,8 +414,6 @@ fn discover_docker_bridges() -> Vec<String> {
 }
 
 fn discover_host_nic() -> Option<String> {
-    use nix::ifaddrs::getifaddrs;
-    use nix::sys::socket::AddressFamily;
     let skip_prefixes = ["lo", "br-", "docker", "veth", "virbr", "tun", "tap"];
     let addrs = getifaddrs().ok()?;
     for ifaddr in addrs {
